@@ -51,6 +51,8 @@ def load_state():
         "base_price": 0,
         "max_dca": 5,
         "sl_percent": 15.0,
+    "early_cut_loss": 1.0,
+    "dump_pause_until": 0,
         "budget": 1000.0,
         "dynamic_step": False,
         "trailing_drop": 100.0,
@@ -167,6 +169,38 @@ def check_rsi_divergence(klines, period=14):
         return False
     except:
         return False
+
+def check_bearish_breakdown_for_cut(klines_5m):
+    """
+    Умный анализ пробоя вниз:
+    Проверяет, не начался ли уверенный дамп, чтобы вовремя срезать микро-минус
+    """
+    if not klines_5m or len(klines_5m) < 6:
+        return False, "Недостаточно данных"
+    try:
+        closes = [float(k[4]) for k in klines_5m]
+        opens = [float(k[1]) for k in klines_5m]
+        lows = [float(k[3]) for k in klines_5m]
+        volumes = [float(k[5]) for k in klines_5m]
+
+        curr_red = closes[-1] < opens[-1]
+        c1_red = closes[-2] < opens[-2]
+        c2_red = closes[-3] < opens[-3]
+
+        local_min_past = min(lows[-6:-2])
+        is_breakdown = closes[-1] < local_min_past
+
+        avg_vol = sum(volumes[-10:-2]) / 8 if len(volumes) >= 10 else volumes[-1]
+        high_sell_vol = volumes[-1] > (avg_vol * 1.2) or volumes[-2] > (avg_vol * 1.2)
+
+        # Сигнал слива: пробой локального лоя на красных свечах ИЛИ 3 красные свечи подряд с повышенным объемом
+        if curr_red and c1_red and is_breakdown:
+            return True, f"Пробой поддержки вниз ({closes[-1]:.1f}) на 2+ красных свечах"
+        if curr_red and c1_red and c2_red and high_sell_vol:
+            return True, f"Давление медведей: 3 красные свечи подряд с ростом объема"
+        return False, ""
+    except Exception as e:
+        return False, str(e)
 
 def fetch_crypto_news():
     try:
@@ -452,6 +486,21 @@ def force_dca(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка при усреднении: {e}")
 
+@bot.message_handler(commands=['set_early_cut'])
+def handle_set_early_cut(message):
+    if not is_allowed(message): return
+    try:
+        val = float(message.text.split()[1])
+        if val <= 0:
+            bot.reply_to(message, "❌ Значение должно быть больше 0.")
+            return
+        state = load_state()
+        state["early_cut_loss"] = val
+        save_state(state)
+        bot.reply_to(message, f"✅ Порог умного сброса микро-минуса установлен на -{val:.2f} USDT.")
+    except (IndexError, ValueError):
+        bot.reply_to(message, "Использование: /set_early_cut 1.0 (закрывать при минусе от 1.0$ если свечи сливают)")
+
 @bot.message_handler(commands=['set_sl'])
 def set_sl(message):
     if not check_auth(message): return
@@ -632,6 +681,16 @@ def monitor_price():
                     except Exception as e:
                         print("AI Check error:", e)
 
+                                # Проверка паузы после раннего защитного сброса
+                now_ts = time_module.time()
+                if now_ts < state.get("dump_pause_until", 0):
+                    rem_sec = int(state.get("dump_pause_until", 0) - now_ts)
+                    if now_ts - state.get("last_pause_msg", 0) > 180:
+                        bot.send_message(ALLOWED_USER_ID, f"⏸ <b>Пауза после сброса позиции</b>\nРынок штормит. Жду стабилизации еще {rem_sec // 60} мин {rem_sec % 60} сек...", parse_mode="HTML")
+                        state["last_pause_msg"] = now_ts
+                        save_state(state)
+                    continue
+
                 # --- 1. ЕСЛИ НЕТ ПОЗИЦИИ ---
                 if pos_size == 0 and not state.get("auto_paused"):
                     # Умный вход: определяем тренд по EMA и RSI
@@ -694,6 +753,35 @@ def monitor_price():
                         save_state(state)
                         bot.send_message(ALLOWED_USER_ID, f"🚨 <b>STOP-LOSS (BTCUSDT)!</b>\nПозиция закрыта: {pos_size} BTC по {current_price:.2f}\nУбыток {abs(unrealised_pnl):.2f}. Бот остановлен во избежание слива.", parse_mode="HTML")
                         continue
+
+                                        # 2. Умный сброс микро-минуса (Smart Early Cut)
+                    # Если позиция ушла в небольшой минус (-0.5$ ... -2.5$) и свечи показывают реальный слив
+                    early_cut_threshold = float(state.get("early_cut_loss", 1.0))
+                    if is_long and (unrealised_pnl <= -early_cut_threshold) and (unrealised_pnl > -max_loss_usdt):
+                        klines_dump = get_klines("BTCUSDT", "5", 15)
+                        is_dumping, dump_reason = check_bearish_breakdown_for_cut(klines_dump)
+                        if is_dumping:
+                            close_side = "Sell"
+                            session.place_order(category="linear", symbol="BTCUSDT", side=close_side, orderType="Market", qty=str(pos_size), reduceOnly=True)
+                            log_trade("Smart Early Cut", pos_size, current_price, unrealised_pnl)
+                            
+                            state["dump_pause_until"] = time_module.time() + 600 # 10 минут пауза
+                            state["base_price"] = current_price
+                            state["dca_step"] = 0
+                            state["highest_price"] = 0
+                            state["lowest_price"] = 0
+                            state["trailing_active"] = False
+                            save_state(state)
+                            
+                            bot.send_message(
+                                ALLOWED_USER_ID,
+                                f"✂️ <b>Умный сброс микро-минуса (Smart Cut)!</b>\n"
+                                f"Зафиксировал небольшой минус: <b>{unrealised_pnl:.2f} USDT</b> во избежание глубокой просадки.\n"
+                                f"Причина: <i>{dump_reason}</i>\n\n"
+                                f"⏸ Включена пауза 10 минут. Подождем спокойное дно и отыграем в плюс!",
+                                parse_mode="HTML"
+                            )
+                            continue
 
                     # 3.5 Смена тренда (Переворот позиции)
                     klines_trend = get_klines("BTCUSDT", "15", 200)
