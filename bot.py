@@ -488,7 +488,7 @@ def force_dca(message):
 
 @bot.message_handler(commands=['set_early_cut'])
 def handle_set_early_cut(message):
-    if not is_allowed(message): return
+    if not check_auth(message): return
     try:
         val = float(message.text.split()[1])
         if val <= 0:
