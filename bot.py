@@ -57,7 +57,8 @@ def load_state():
         "dynamic_step": False,
         "trailing_drop": 100.0,
         "trailing_active": False,
-        "trailing_high": 0.0
+        "trailing_high": 0.0,
+        "aggression": "high"
     }
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
@@ -68,6 +69,7 @@ def load_state():
                 for k, v in default_state.items():
                     if k not in data:
                         data[k] = v
+                data["aggression"] = "high"
                 return data
             except Exception:
                 return default_state
@@ -170,37 +172,115 @@ def check_rsi_divergence(klines, period=14):
     except:
         return False
 
-def check_bearish_breakdown_for_cut(klines_5m):
+def check_bearish_breakdown_for_cut(klines_15m):
     """
-    Умный анализ пробоя вниз:
-    Проверяет, не начался ли уверенный дамп, чтобы вовремя срезать микро-минус
+    Надежный анализ реального слома структуры тренда (на 15m свечах):
+    Защищает от ложных срезов на 5-минутном рыночном шуме.
+    Срабатывает ТОЛЬКО при реальной смене тренда на дамп.
     """
-    if not klines_5m or len(klines_5m) < 6:
+    if not klines_15m or len(klines_15m) < 15:
         return False, "Недостаточно данных"
     try:
-        closes = [float(k[4]) for k in klines_5m]
-        opens = [float(k[1]) for k in klines_5m]
-        lows = [float(k[3]) for k in klines_5m]
-        volumes = [float(k[5]) for k in klines_5m]
+        closes = [float(k[4]) for k in klines_15m]
+        opens = [float(k[1]) for k in klines_15m]
+        lows = [float(k[3]) for k in klines_15m]
+        volumes = [float(k[5]) for k in klines_15m]
 
         curr_red = closes[-1] < opens[-1]
         c1_red = closes[-2] < opens[-2]
         c2_red = closes[-3] < opens[-3]
 
-        local_min_past = min(lows[-6:-2])
+        # Локальный минимум за последние 8 свечей (2 часа)
+        local_min_past = min(lows[-10:-2])
         is_breakdown = closes[-1] < local_min_past
 
-        avg_vol = sum(volumes[-10:-2]) / 8 if len(volumes) >= 10 else volumes[-1]
-        high_sell_vol = volumes[-1] > (avg_vol * 1.2) or volumes[-2] > (avg_vol * 1.2)
+        avg_vol = sum(volumes[-15:-2]) / 13 if len(volumes) >= 15 else volumes[-1]
+        high_sell_vol = volumes[-1] > (avg_vol * 1.5) or volumes[-2] > (avg_vol * 1.5)
 
-        # Сигнал слива: пробой локального лоя на красных свечах ИЛИ 3 красные свечи подряд с повышенным объемом
-        if curr_red and c1_red and is_breakdown:
-            return True, f"Пробой поддержки вниз ({closes[-1]:.1f}) на 2+ красных свечах"
+        # Сигнал истинного слива:
+        if is_breakdown and curr_red and high_sell_vol:
+            return True, f"Истинный пробой поддержки ({closes[-1]:.1f}) на 15m с ростом объема"
         if curr_red and c1_red and c2_red and high_sell_vol:
-            return True, f"Давление медведей: 3 красные свечи подряд с ростом объема"
+            return True, "Мощный безоткатный дамп (3 красные 15m свечи с объемом)"
         return False, ""
     except Exception as e:
         return False, str(e)
+
+def analyze_market_entry(klines_15m, current_price, aggression="high"):
+    """
+    Агрессивный алгоритм с анализом RSI и структуры движения:
+    1. По умолчанию бот ВСЕГДА АГРЕССИВЕН (не ждет на заборе).
+    2. Обязательно рассчитывает и учитывает RSI (14 периодов, 15m свечи).
+    3. РЫНОК С ВЫСОКИМ RSI (52-80), НО ИДЕТ ВВЕРХ:
+       Если тренд бычий (EMA20 > EMA50 или цена выше скользящих),
+       и свечи показывают подъем (зеленый моментум, рост объемов, обновление вершин),
+       бот понимает, что это продолжение мощного ралли, и СМЕЛО ВЛИВАЕТСЯ ТУДА!
+    4. Защита от покупки на самом излете:
+       - Не входить, если RSI > 82 (экстремальный перегрев перед резким сбросом).
+       - Не входить, если при RSI > 72 виден явный разворотный слив (длинная тень сверху или 2 красных бара с объемом).
+    5. В боковике или на откате (RSI 30-52):
+       - Мгновенно подбирает позицию при первом признаке движения вверх.
+    """
+    if not klines_15m or len(klines_15m) < 40:
+        return False, "Сбор данных свечей...", 50.0, "UNKNOWN"
+
+    closes = [float(k[4]) for k in klines_15m]
+    opens = [float(k[1]) for k in klines_15m]
+    highs = [float(k[2]) for k in klines_15m]
+    volumes = [float(k[5]) for k in klines_15m]
+
+    rsi = calculate_rsi(klines_15m)
+    ema_20 = calculate_ema(closes, 20)
+    ema_50 = calculate_ema(closes, 50)
+
+    curr_green = closes[-1] > opens[-1]
+    prev_green = closes[-2] > opens[-2] if len(closes) > 1 else False
+
+    # Бычий тренд по EMA или динамике цен
+    is_bullish = False
+    if ema_20 and ema_50:
+        is_bullish = (current_price >= ema_50) or (ema_20 >= ema_50) or (current_price >= ema_20)
+    else:
+        is_bullish = (current_price >= closes[-10])
+
+    avg_vol = sum(volumes[-15:-1]) / 14 if len(volumes) >= 15 else volumes[-1]
+    local_high = max(highs[-10:])
+    pushing_highs = (current_price >= local_high * 0.996) # Цена у вершины диапазона / пробой
+
+    # Проверка разворотной падающей звезды (Shooting Star с длинным фитилем сверху)
+    upper_wick = highs[-1] - max(opens[-1], closes[-1])
+    body = abs(closes[-1] - opens[-1])
+    is_rejection_candle = (upper_wick > body * 2.2) and (upper_wick > (current_price * 0.002))
+
+    # 1. ЗАЩИТА ОТ КРАХА НА САМОМ ПИКЕ
+    if rsi > 88:
+        return False, f"Экстремальный перегрев (RSI: {rsi:.1f} > 88). Жду короткой паузы, чтобы не купить на абсолютном хае", rsi, "EXTREME_OVERBOUGHT"
+
+    if rsi > 74 and is_rejection_candle and not curr_green:
+        return False, f"RSI высокий ({rsi:.1f}) с разворотной верхней тенью. Жду подтверждения движения", rsi, "REVERSAL_EXHAUSTION"
+
+    if rsi > 72 and (not curr_green) and (not prev_green) and (volumes[-1] > avg_vol * 1.3):
+        return False, f"RSI высокий ({rsi:.1f}) на волне фиксации прибыли (2 красные свечи с объемом)", rsi, "PROFIT_TAKING"
+
+    # 2. РЫНОК С ВЫСОКИМ RSI (52 - 80), НО ИДЕТ ВВЕРХ -> ВЛИВАЕМСЯ!
+    if rsi >= 52:
+        market_heading_up = is_bullish and (curr_green or prev_green or pushing_highs or (current_price > closes[-3]))
+        if market_heading_up:
+            return True, f"Вливаемся в растущий тренд! Высокий RSI ({rsi:.1f}) подтверждает силу покупателей (зеленый моментум, EMA бычьи)", rsi, "MOMENTUM_BULL_ENTRY"
+        if aggression == "high" and (curr_green or not is_rejection_candle):
+            return True, f"Агрессивное вливание в моментум (RSI: {rsi:.1f}, цена: {current_price:.1f})", rsi, "AGGRESSIVE_HIGH_RSI_FLOW"
+
+    # 3. УМЕРЕННАЯ ЗОНА RSI (40 - 52)
+    if is_bullish or curr_green or prev_green:
+        return True, f"Вход по тренду (RSI: {rsi:.1f}, бычья структура)", rsi, "TREND_FLOW"
+
+    # 4. ЗОНА ОТКАТА / ПЕРЕПРОДАННОСТИ (RSI < 40)
+    if curr_green or rsi < 34:
+        return True, f"Ловля отскока от локального дна (RSI: {rsi:.1f})", rsi, "PULLBACK_BOUNCE"
+
+    # 5. ЕСЛИ БЕЗОТКАТНЫЙ СПАД ВНИЗ
+    trend_str = "Бычий 🐂" if is_bullish else "Коррекция/Дамп 🔻"
+    return False, f"Тренд: {trend_str}, RSI: {rsi:.1f}. Жду остановки локального спада", rsi, "WAITING"
 
 def fetch_crypto_news():
     try:
@@ -263,7 +343,9 @@ def send_welcome(message):
         f"🤖 <b>Торговый бот Уровень 3 (BTC)</b>\n\n"
         "/start_auto - Запустить автоторговлю\n"
         "/stop_auto - Остановить автоторговлю\n"
-        "/status - Статус бота\n"
+        "/status - Статус бота и параметров\n"
+        "/force_buy - Мгновенно открыть лонг по рынку\n"
+        "/set_aggression [high/normal] - Режим активности (по умолч.: HIGH)\n"
         "/set_dynamic_step [1/0] - Вкл/Выкл умный шаг (ATR)\n"
         "/set_trailing [DROP] - Настроить откат трейлинга\n"
         "/check_ai - Запросить ИИ-анализ рынка\n\n"
@@ -271,6 +353,58 @@ def send_welcome(message):
         "/profit, /balance, /price\n"
         "/set_leverage, /set_budget, /set_step, /set_qty, /set_sl, /close_all", parse_mode="HTML"
     )
+
+@bot.message_handler(commands=['force_buy'])
+def force_buy_cmd(message):
+    if not check_auth(message): return
+    try:
+        response = session.get_tickers(category="linear", symbol="BTCUSDT")
+        current_price = float(response['result']['list'][0]['lastPrice'])
+        qty = str(float(state.get("qty", 0.001)))
+        
+        pos_resp = session.get_positions(category="linear", symbol="BTCUSDT")
+        pos_size = 0.0
+        if pos_resp.get('result') and pos_resp['result'].get('list'):
+            pos_size = safe_float(pos_resp['result']['list'][0].get('size', 0))
+            
+        if pos_size > 0:
+            bot.reply_to(message, f"⚠️ У вас уже открыта позиция {pos_size} BTC! Для добавления объема используйте /dca.", parse_mode="HTML")
+            return
+            
+        session.place_order(category="linear", symbol="BTCUSDT", side="Buy", orderType="Market", qty=qty)
+        log_trade("Force Buy", float(qty), current_price, 0.0)
+        
+        state["auto_trade"] = True
+        state["base_price"] = current_price
+        state["dca_step"] = 1
+        state["highest_price"] = current_price
+        state["lowest_price"] = current_price
+        state["trailing_active"] = False
+        state["breakeven_notified"] = False
+        state["trade_direction"] = "Buy"
+        state["auto_paused"] = False
+        state.pop("waiting_entry_notified", None)
+        save_state(state)
+        
+        bot.reply_to(message, f"⚡ <b>Принудительный вход выполнен!</b>\nКуплено: <b>{qty} BTC</b> по цене <b>{current_price:.2f}</b>\nСделка передана под автосопровождение бота (Трейлинг + DCA).", parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка при входе: {e}")
+
+@bot.message_handler(commands=['set_aggression'])
+def set_aggression_cmd(message):
+    if not check_auth(message): return
+    try:
+        parts = message.text.split()
+        if len(parts) > 1 and parts[1].lower() in ['high', 'normal']:
+            val = parts[1].lower()
+            state["aggression"] = val
+            save_state(state)
+            desc = "Максимально активный вход: вливается в растущий рынок даже при высоком RSI" if val == "high" else "Сбалансированный вход"
+            bot.reply_to(message, f"✅ Режим активности установлен: <b>{val.upper()}</b>\n{desc}", parse_mode="HTML")
+        else:
+            bot.reply_to(message, "Использование: <code>/set_aggression high</code> (или <code>normal</code>)\n<i>По умолчанию: HIGH (агрессивно вливается в растущий тренд)</i>", parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['set_dynamic_step'])
 def set_dynamic_step_cmd(message):
@@ -332,6 +466,7 @@ def get_status(message):
     status_text = (
         f"📊 <b>Статус бота</b>\n\n"
         f"Автоторговля: {'✅ ВКЛ' if state['auto_trade'] else '⏸ ВЫКЛ'}\n"
+        f"Режим входа: <b>{state.get('aggression', 'high').upper()}</b> (Всегда агрессивен + RSI Trend Flow)\n"
         f"Базовая цена: {state['base_price']}\n"
         f"Динамический шаг (ATR): {'✅ ВКЛ' if state.get('dynamic_step') else '⏸ ВЫКЛ'}\n"
         f"Шаг (статика): {state['step']}\n"
@@ -693,25 +828,27 @@ def monitor_price():
 
                 # --- 1. ЕСЛИ НЕТ ПОЗИЦИИ ---
                 if pos_size == 0 and not state.get("auto_paused"):
-                    # Умный вход: определяем тренд по EMA и RSI
-                    klines = get_klines("BTCUSDT", "15", 200)
-                    rsi = calculate_rsi(klines)
-                    closes = [float(k[4]) for k in klines]
-                    ema_100 = calculate_ema(closes, 100)
+                    # Умный адаптивный вход: всегда агрессивен, вливается в растущий тренд с высоким RSI
+                    klines = get_klines("BTCUSDT", "15", 100)
+                    aggression = state.get("aggression", "high")
+                    should_enter, entry_reason, entry_rsi, market_trend = analyze_market_entry(klines, current_price, aggression)
                     
-                    is_uptrend = current_price > ema_100
-                    
-                    # Логика входа (ТОЛЬКО LONG)
-                    if rsi >= 45: # Ждем пока RSI не опустится (просадка) для выгодной покупки
+                    if not should_enter:
                         import time
-                        if time.time() - state.get("last_entry_wait_msg", 0) > 300: # Каждые 5 минут напоминаем
-                            bot.send_message(ALLOWED_USER_ID, f"⏳ <b>Слежу за рынком (LONG)</b>\nЖду когда RSI упадет ниже 45. Сейчас RSI: {rsi:.1f}.\n(Текущая цена: {current_price})", parse_mode="HTML")
+                        if time.time() - state.get("last_entry_wait_msg", 0) > 300: # Напоминаем раз в 5 минут
+                            bot.send_message(
+                                ALLOWED_USER_ID,
+                                f"""⏳ <b>Слежу за рынком BTC</b>
+Статус: {entry_reason}
+Текущая цена: <b>{current_price:.1f}</b> | RSI(15m): <b>{entry_rsi:.1f}</b>
+<i>Режим: {aggression.upper()} (вливание в тренд включено)</i>""",
+                                parse_mode="HTML"
+                            )
                             state["last_entry_wait_msg"] = time.time()
                             save_state(state)
                         continue
-                    else:
-                        trade_side = "Buy"
-                        
+
+                    trade_side = "Buy"
                     state.pop("waiting_entry_notified", None)
                     qty = str(float(state.get("qty", 0.001)))
                     session.place_order(category="linear", symbol="BTCUSDT", side=trade_side, orderType="Market", qty=qty)
@@ -720,12 +857,19 @@ def monitor_price():
                     state["dca_step"] = 1
                     state["highest_price"] = current_price
                     state["lowest_price"] = current_price
+                    state["trailing_active"] = False
                     state["breakeven_notified"] = False
                     state["trade_direction"] = trade_side
                     save_state(state)
                     
-                    dir_str = "ЛОНГ (Вверх) 🟢" if trade_side == "Buy" else "ШОРТ (Вниз) 🔴"
-                    bot.send_message(ALLOWED_USER_ID, f"🚀 <b>Открыта новая сделка (BTCUSDT)!</b>\nНаправление: {dir_str}\nЗашел в рынок по цене: {current_price:.2f}\n🛒 Объем: {qty} BTC", parse_mode="HTML")
+                    bot.send_message(
+                        ALLOWED_USER_ID,
+                        f"""🚀 <b>Открыта сделка ЛОНГ 🟢 (BTCUSDT)!</b>
+Причина входа: <i>{entry_reason}</i>
+Вход по цене: <b>{current_price:.2f}</b>
+🛒 Рабочий объем: <b>{qty} BTC</b> (RSI: {entry_rsi:.1f})""",
+                        parse_mode="HTML"
+                    )
                     continue
                     
                 # --- ЕСЛИ ПОЗИЦИЯ ЕСТЬ ---
@@ -754,18 +898,18 @@ def monitor_price():
                         bot.send_message(ALLOWED_USER_ID, f"🚨 <b>STOP-LOSS (BTCUSDT)!</b>\nПозиция закрыта: {pos_size} BTC по {current_price:.2f}\nУбыток {abs(unrealised_pnl):.2f}. Бот остановлен во избежание слива.", parse_mode="HTML")
                         continue
 
-                                        # 2. Умный сброс микро-минуса (Smart Early Cut)
-                    # Если позиция ушла в небольшой минус (-0.5$ ... -2.5$) и свечи показывают реальный слив
-                    early_cut_threshold = float(state.get("early_cut_loss", 1.0))
+                    # 2. Умный сброс микро-минуса (Smart Early Cut)
+                    # Режет позицию ТОЛЬКО при реальном сломе структуры на 15m свечах, а не на 5m шуме
+                    early_cut_threshold = float(state.get("early_cut_loss", 2.5))
                     if is_long and (unrealised_pnl <= -early_cut_threshold) and (unrealised_pnl > -max_loss_usdt):
-                        klines_dump = get_klines("BTCUSDT", "5", 15)
+                        klines_dump = get_klines("BTCUSDT", "15", 20)
                         is_dumping, dump_reason = check_bearish_breakdown_for_cut(klines_dump)
                         if is_dumping:
                             close_side = "Sell"
                             session.place_order(category="linear", symbol="BTCUSDT", side=close_side, orderType="Market", qty=str(pos_size), reduceOnly=True)
                             log_trade("Smart Early Cut", pos_size, current_price, unrealised_pnl)
                             
-                            state["dump_pause_until"] = time_module.time() + 600 # 10 минут пауза
+                            state["dump_pause_until"] = time_module.time() + 300 # 5 минут пауза
                             state["base_price"] = current_price
                             state["dca_step"] = 0
                             state["highest_price"] = 0
@@ -775,41 +919,50 @@ def monitor_price():
                             
                             bot.send_message(
                                 ALLOWED_USER_ID,
-                                f"✂️ <b>Умный сброс микро-минуса (Smart Cut)!</b>\n"
-                                f"Зафиксировал небольшой минус: <b>{unrealised_pnl:.2f} USDT</b> во избежание глубокой просадки.\n"
-                                f"Причина: <i>{dump_reason}</i>\n\n"
-                                f"⏸ Включена пауза 10 минут. Подождем спокойное дно и отыграем в плюс!",
+                                f"""✂️ <b>Умный сброс (Smart Cut)!</b>
+Зафиксирован убыток: <b>{unrealised_pnl:.2f} USDT</b> во избежание просадки.
+Причина: <i>{dump_reason}</i>
+
+⏸ Пауза 5 минут. Ищем разворот вверх!""",
                                 parse_mode="HTML"
                             )
                             continue
 
-                    # 3.5 Смена тренда (Переворот позиции)
-                    klines_trend = get_klines("BTCUSDT", "15", 200)
-                    closes_trend = [float(k[4]) for k in klines_trend]
-                    ema_100 = calculate_ema(closes_trend, 100)
-                    # Закрытие сделок и смена тренда выключены (режим ТОЛЬКО ЛОНГ)
-
                     # 4. Динамический Take-Profit (Трейлинг)
-                    # Вместо жесткого закрытия, когда цена доходит до TP, мы просто даем ей расти.
-                    # Но если профит есть, и цена пошла назад - закрываем
-                    tp_step = max(step * 0.8, 50) # Снизили порог активации
+                    # Если было усреднение (dca_step > 1), цель приближаем к рынку для быстрого гарантированного плюса
+                    current_dca_step = state.get("dca_step", 1)
+                    if current_dca_step > 1:
+                        tp_step = max(50.0, step * 0.25) # Быстрый выход из усреднения
+                    else:
+                        tp_step = max(70.0, step * 0.45) # Стандартная фиксация прибыли
+
                     tp_condition_met = (current_price >= avg_price + tp_step) if is_long else (current_price <= avg_price - tp_step)
                     
                     if tp_condition_met and unrealised_pnl > 0:
-                        # Включаем трейлинг, если он еще не включен
                         if not state.get("trailing_active"):
                             state["trailing_active"] = True
                             state["highest_price"] = current_price
                             save_state(state)
-                            bot.send_message(ALLOWED_USER_ID, f"🚀 <b>Цена вышла в хороший плюс!</b>\nАктивирован Трейлинг-Стоп. Тянем профит...", parse_mode="HTML")
+                            bot.send_message(ALLOWED_USER_ID, f"🚀 <b>Цена вышла в хороший плюс! (+{unrealised_pnl:.2f}$)</b>\nАктивирован Трейлинг-Стоп. Тянем прибыль...", parse_mode="HTML")
                         
-                        # Если цена упала на 20% от пройденного роста (откатывается)
                         highest = state.get("highest_price", current_price)
-                        if is_long and current_price < highest - (highest - avg_price) * 0.25:
+                        # Откат трейлинга: если цена откатывает на 25% от пика прибыли или на 70$
+                        profit_dist = max(10.0, highest - avg_price)
+                        trailing_pullback = min(state.get("trailing_drop", 80.0), profit_dist * 0.3)
+                        
+                        if is_long and (current_price <= highest - trailing_pullback):
                             close_side = "Sell"
                             session.place_order(category="linear", symbol="BTCUSDT", side=close_side, orderType="Market", qty=str(pos_size), reduceOnly=True)
                             log_trade("Take-Profit (Smart Trailing)", pos_size, current_price, unrealised_pnl)
-                            bot.send_message(ALLOWED_USER_ID, f"🎯 <b>Сделка закрыта по Smart Трейлингу!</b>\nПозиция закрыта по {current_price:.2f}\nПрибыль: ~{unrealised_pnl:.2f} USDT\n\n🔄 Ждем новую сделку...", parse_mode="HTML")
+                            bot.send_message(
+                                ALLOWED_USER_ID,
+                                f"""🎯 <b>Сделка закрыта в ПЛЮС!</b>
+Цена выхода: <b>{current_price:.2f}</b>
+Прибыль: <b>+{unrealised_pnl:.2f} USDT</b> 💸
+
+🔄 Анализирую рынок для следующего входа...""",
+                                parse_mode="HTML"
+                            )
                             
                             state["base_price"] = current_price
                             state["dca_step"] = 0
@@ -820,37 +973,18 @@ def monitor_price():
                             state.pop("margin_error_notified", None)
                             save_state(state)
                             continue
-                            
-                    # Если трейлинг не сработал на откате, просто обновляем хаи
+
                     if state.get("trailing_active") and is_long:
                         if current_price > state.get("highest_price", current_price):
                             state["highest_price"] = current_price
-                            # Спамим об обновлении максимума каждые 20$ профита
                             last_notified = state.get("highest_price_notified", avg_price)
-                            if current_price > last_notified + 20:
-                                bot.send_message(ALLOWED_USER_ID, f"🔥 <b>Трейлинг растет!</b>\nНовый максимум: {current_price:.2f} (Защищенный профит увеличился)", parse_mode="HTML")
+                            if current_price > last_notified + 25:
+                                bot.send_message(ALLOWED_USER_ID, f"🔥 <b>Трейлинг растет!</b>\nПик: <b>{current_price:.2f}</b> (PnL: +{unrealised_pnl:.2f}$)", parse_mode="HTML")
                                 state["highest_price_notified"] = current_price
                             save_state(state)
-                    # --- конец нового блока TP ---
-                    if False: # Отключаем старый кусок
-                        close_side = "Sell" if is_long else "Buy"
-                        session.place_order(category="linear", symbol="BTCUSDT", side=close_side, orderType="Market", qty=str(pos_size), reduceOnly=True)
-                        log_trade("Take-Profit (100%)", pos_size, current_price, unrealised_pnl)
-                        bot.send_message(ALLOWED_USER_ID, f"🎯 <b>Сделка закрыта в ПЛЮС по Тейк-профиту!</b>\nПозиция закрыта по {current_price:.2f}\nПрибыль: ~{unrealised_pnl:.2f} USDT\n\n🔄 Ждем новую сделку...", parse_mode="HTML")
-                        
-                        state["base_price"] = current_price
-                        state["dca_step"] = 0
-                        state["highest_price"] = 0
-                        state["lowest_price"] = 0
-                        state.pop("budget_exceeded_notified", None)
-                        state.pop("margin_error_notified", None)
-                        save_state(state)
-                        continue
 
-                    # 5. Мгновенное усреднение (Smart DCA) при минусе
-                    # Увеличиваем шаг с каждым усреднением (чтобы не закупаться слишком часто на сильном падении)
-                    current_dca_step = state.get("dca_step", 1)
-                    dynamic_dca_step_size = step * (1 + (current_dca_step - 1) * 0.5) # 1x, 1.5x, 2x, 2.5x...
+                    # 5. Умное усреднение (DCA)
+                    dynamic_dca_step_size = step * (1 + (current_dca_step - 1) * 0.4)
                     target_dca_price = (state.get("base_price", avg_price) - dynamic_dca_step_size) if is_long else (state.get("base_price", avg_price) + dynamic_dca_step_size)
                     
                     dca_condition_met = (current_price <= target_dca_price) if is_long else (current_price >= target_dca_price)
@@ -859,15 +993,22 @@ def monitor_price():
                         klines_dca = get_klines("BTCUSDT", "5", 20)
                         rsi_dca = calculate_rsi(klines_dca)
                         
-                        # Строгий индикатор для откупа (RSI < 30 для лонга)
-                        if (is_long and rsi_dca >= 30) or (not is_long and rsi_dca <= 70):
+                        # Проверяем, не летит ли сейчас безоткатный нож (свеча падения > 300$)
+                        is_knife = False
+                        if len(klines_dca) >= 2:
+                            c_open = float(klines_dca[-1][1])
+                            c_close = float(klines_dca[-1][4])
+                            if c_close < c_open and (c_open - c_close) > 300:
+                                is_knife = True
+                        
+                        if is_knife and rsi_dca > 42:
                             import time
-                            if time.time() - state.get("last_dca_wait_msg", 0) > 180: # Каждые 3 минуты
-                                bot.send_message(ALLOWED_USER_ID, f"⏳ <b>Готов усреднять, но жду дно!</b>\nЦена ({current_price}) дошла до уровня покупки, но RSI еще высокий ({rsi_dca:.1f}). Ждем паники (RSI < 30)...", parse_mode="HTML")
+                            if time.time() - state.get("last_dca_wait_msg", 0) > 180:
+                                bot.send_message(ALLOWED_USER_ID, f"⏳ <b>Цена дошла до уровня DCA ({current_price:.1f})</b>\nЖду завершения импульсной минутной свечи...", parse_mode="HTML")
                                 state["last_dca_wait_msg"] = time.time()
                                 save_state(state)
                             continue
-                            
+                        
                         state.pop("waiting_dca_notified", None)
                         
                         if position_im >= budget:
@@ -880,7 +1021,7 @@ def monitor_price():
                             dca_step = state.get("dca_step", 1)
                             if dca_step <= state.get("max_dca", 10):
                                 base_qty = float(state.get("qty", 0.001))
-                                multiplier = 1.0 + (dca_step * 0.2) if dca_step < 5 else 2.0 
+                                multiplier = 1.0 + (dca_step * 0.2) if dca_step < 5 else 2.0
                                 current_dca_qty = round(base_qty * multiplier, 3)
                                 if current_dca_qty < 0.001: current_dca_qty = 0.001
                                 buy_qty = str(round(current_dca_qty, 3))
@@ -895,27 +1036,26 @@ def monitor_price():
                                 state.pop("lowest_price", None)
                                 state.pop("breakeven_notified", None)
                                 save_state(state)
-                                bot.send_message(ALLOWED_USER_ID, f"⚡ <b>Мгновенное усреднение!</b>\nЦена достигла {current_price:.2f}.\n🛒 Добавлен объем {buy_qty}.", parse_mode="HTML")
+                                bot.send_message(ALLOWED_USER_ID, f"⚡ <b>Усреднение выполнено!</b>\nДобавлен объем: <b>{buy_qty} BTC</b> по цене <b>{current_price:.2f}</b>\nНовая средняя цена снижена, цель выхода приближена!", parse_mode="HTML")
                             else:
                                 if not state.get("max_dca_notified"):
                                     bot.send_message(ALLOWED_USER_ID, f"⚠️ Максимальное количество шагов усреднения достигнуто. Ждем профита.")
                                     state["max_dca_notified"] = True
                                     save_state(state)
-
             elif state.get("auto_paused"):
-                # Авто-возобновление после ИИ-паузы
+                # Авто-возобновление после ИИ-паузы или дампа
                 klines = get_klines("BTCUSDT", "15", 50)
                 rsi = calculate_rsi(klines)
-                resume_rsi = 55
-                if rsi < resume_rsi:
-                    response = session.get_tickers(category="linear", symbol="BTCUSDT")
-                    current_price = float(response['result']['list'][0]['lastPrice'])
+                closes = [float(k[4]) for k in klines]
+                ema_50 = calculate_ema(closes, 50) or closes[-1]
+                
+                # Если рынок бычий (выше EMA50) или RSI остыл ниже 60 - возобновляем!
+                if (current_price >= ema_50 and rsi < 70) or (rsi < 55):
                     state["auto_trade"] = True
                     state["auto_paused"] = False
                     state["base_price"] = current_price
                     save_state(state)
-                    bot.send_message(ALLOWED_USER_ID, f"🟢 <b>Рынок готов (RSI: {rsi:.1f})!</b>\nАвтоторговля BTCUSDT ВОЗОБНОВЛЕНА.", parse_mode="HTML")
-
+                    bot.send_message(ALLOWED_USER_ID, f"🟢 <b>Рынок стабилизировался (RSI: {rsi:.1f})!</b>\nАвтоторговля BTCUSDT ВОЗОБНОВЛЕНА.", parse_mode="HTML")
         except Exception as e:
             err_str = str(e)
             print(f"Ошибка в мониторинге: {err_str}")
@@ -955,25 +1095,25 @@ def monitor_price():
 
 def setup_commands():
     commands = [
-        telebot.types.BotCommand("start", "ℹ️ Информация"),
-        telebot.types.BotCommand("status", "📊 Статус бота"),
+        telebot.types.BotCommand("start", "ℹ️ Меню и команды"),
+        telebot.types.BotCommand("force_buy", "⚡ Немедленно войти в ЛОНГ"),
         telebot.types.BotCommand("start_auto", "▶️ Запуск автоторговли"),
         telebot.types.BotCommand("stop_auto", "⏸ Стоп автоторговли"),
-        telebot.types.BotCommand("set_mode", "🚀 Выбрать режим (scalp/standard)"),
-        telebot.types.BotCommand("set_dynamic_step", "⚙️ Умный шаг сетки"),
+        telebot.types.BotCommand("status", "📊 Полный статус бота"),
+        telebot.types.BotCommand("set_aggression", "🔥 Активность (high/normal)"),
+        telebot.types.BotCommand("set_early_cut", "✂️ Порог сброса минуса"),
+        telebot.types.BotCommand("set_dynamic_step", "⚙️ Умный шаг сетки (ATR)"),
         telebot.types.BotCommand("set_trailing", "⚙️ Откат трейлинга"),
+        telebot.types.BotCommand("profit", "💸 Прибыль за 50 сделок"),
+        telebot.types.BotCommand("balance", "💰 Баланс аккаунта"),
+        telebot.types.BotCommand("price", "📈 Текущая цена BTC"),
         telebot.types.BotCommand("check_ai", "🧠 Проверить ИИ"),
-        telebot.types.BotCommand("check_keys", "🔑 Проверить API ключи"),
-        telebot.types.BotCommand("balance", "💰 Баланс"),
-        telebot.types.BotCommand("profit", "💸 Статистика PnL"),
-        telebot.types.BotCommand("price", "📈 Цена BTC"),
         telebot.types.BotCommand("dca", "🚑 Принудительное усреднение"),
-        telebot.types.BotCommand("set_step", "⚙️ Изменить шаг сетки"),
-        telebot.types.BotCommand("set_qty", "⚙️ Изменить объем"),
+        telebot.types.BotCommand("set_step", "⚙️ Шаг сетки"),
+        telebot.types.BotCommand("set_qty", "⚙️ Объем ордера"),
         telebot.types.BotCommand("set_sl", "⚙️ Изменить Stop-Loss"),
         telebot.types.BotCommand("set_budget", "⚙️ Изменить бюджет"),
-        telebot.types.BotCommand("set_leverage", "⚙️ Изменить плечо"),
-        telebot.types.BotCommand("close_all", "🛑 Закрыть позиции")
+        telebot.types.BotCommand("close_all", "🛑 Закрыть все позиции")
     ]
     bot.set_my_commands(commands)
 
