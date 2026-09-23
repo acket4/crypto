@@ -51,8 +51,8 @@ def load_state():
         "base_price": 0,
         "max_dca": 5,
         "sl_percent": 15.0,
-    "early_cut_loss": 1.0,
-    "dump_pause_until": 0,
+        "early_cut_loss": 3.0,
+        "dump_pause_until": 0,
         "budget": 1000.0,
         "dynamic_step": False,
         "trailing_drop": 100.0,
@@ -351,7 +351,7 @@ def send_welcome(message):
         "/check_ai - Запросить ИИ-анализ рынка\n\n"
         "<i>Стандартные настройки:</i>\n"
         "/profit, /balance, /price\n"
-        "/set_leverage, /set_budget, /set_step, /set_qty, /set_sl, /close_all", parse_mode="HTML"
+        "/set_early_cut, /set_leverage, /set_budget, /set_step, /set_qty, /set_sl, /close_all", parse_mode="HTML"
     )
 
 @bot.message_handler(commands=['force_buy'])
@@ -465,14 +465,15 @@ def get_status(message):
     if not check_auth(message): return
     status_text = (
         f"📊 <b>Статус бота</b>\n\n"
-        f"Автоторговля: {'✅ ВКЛ' if state['auto_trade'] else '⏸ ВЫКЛ'}\n"
+        f"Автоторговля: {'✅ ВКЛ' if state.get('auto_trade') else '⏸ ВЫКЛ'}\n"
         f"Режим входа: <b>{state.get('aggression', 'high').upper()}</b> (Всегда агрессивен + RSI Trend Flow)\n"
-        f"Базовая цена: {state['base_price']}\n"
+        f"Базовая цена: {state.get('base_price', 0)}\n"
         f"Динамический шаг (ATR): {'✅ ВКЛ' if state.get('dynamic_step') else '⏸ ВЫКЛ'}\n"
-        f"Шаг (статика): {state['step']}\n"
-        f"Объем: {state['qty']}\n"
-        f"Бюджет: {state['budget']}\n"
-        f"Stop-Loss: {state['sl_percent']}%\n"
+        f"Шаг (статика): {state.get('step', 500)}\n"
+        f"Объем: {state.get('qty', 0.001)}\n"
+        f"Бюджет: {state.get('budget', 240)} USDT\n"
+        f"Stop-Loss: {state.get('sl_percent', 15.0)}%\n"
+        f"Сброс при просадке (Early Cut): <b>-{state.get('early_cut_loss', 3.0):.2f} USDT</b>\n"
         f"Трейлинг откат: {state.get('trailing_drop', 100)}\n"
         f"Активен трейлинг: {'✅ ДА' if state.get('trailing_active') else 'НЕТ'}\n"
     )
@@ -629,12 +630,11 @@ def handle_set_early_cut(message):
         if val <= 0:
             bot.reply_to(message, "❌ Значение должно быть больше 0.")
             return
-        state = load_state()
         state["early_cut_loss"] = val
         save_state(state)
-        bot.reply_to(message, f"✅ Порог умного сброса микро-минуса установлен на -{val:.2f} USDT.")
+        bot.reply_to(message, f"✅ Порог сброса позиции при просадке установлен на <b>-{val:.2f} USDT</b>.\nБот теперь НЕ закроет сделку, пока просадка меньше этой суммы.", parse_mode="HTML")
     except (IndexError, ValueError):
-        bot.reply_to(message, "Использование: /set_early_cut 1.0 (закрывать при минусе от 1.0$ если свечи сливают)")
+        bot.reply_to(message, "Использование: <code>/set_early_cut 3.0</code> (установить допустимый минус в USDT перед сбросом)", parse_mode="HTML")
 
 @bot.message_handler(commands=['set_sl'])
 def set_sl(message):
@@ -884,7 +884,7 @@ def monitor_price():
                         if atr > 0:
                             step = max(step, atr * 1.5)
 
-                    sl_percent = state.get("sl_percent", 5.0)  # Жесткий стоп-лосс 5% по умолчанию
+                    sl_percent = float(state.get("sl_percent", 15.0))  # Стоп-лосс в % от бюджета
                     max_loss_usdt = budget * (sl_percent / 100.0)
 
                     # 1. Жесткий Stop-Loss
@@ -900,7 +900,7 @@ def monitor_price():
 
                     # 2. Умный сброс микро-минуса (Smart Early Cut)
                     # Режет позицию ТОЛЬКО при реальном сломе структуры на 15m свечах, а не на 5m шуме
-                    early_cut_threshold = float(state.get("early_cut_loss", 2.5))
+                    early_cut_threshold = float(state.get("early_cut_loss", 3.0))
                     if is_long and (unrealised_pnl <= -early_cut_threshold) and (unrealised_pnl > -max_loss_usdt):
                         klines_dump = get_klines("BTCUSDT", "15", 20)
                         is_dumping, dump_reason = check_bearish_breakdown_for_cut(klines_dump)
