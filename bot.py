@@ -3,10 +3,14 @@ import sys
 import html
 import time
 import json
+import csv
+import io
+import datetime
 import subprocess
 import threading
 state_lock = threading.Lock()
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 import requests
@@ -84,8 +88,32 @@ state = load_state()
 
 def log_trade(action, qty, price, pnl=0.0):
     try:
+        t_str = time.strftime('%Y-%m-%d %H:%M:%S')
         with open("trades.log", "a") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {action} | QTY: {qty} | Price: {price} | PnL: {pnl}\n")
+            f.write(f"{t_str} | {action} | QTY: {qty} | Price: {price} | PnL: {pnl}\n")
+            
+        # Ведем структурированный JSON-журнал сделок
+        trades_json_file = "trades_history.json"
+        trades_list = []
+        if os.path.exists(trades_json_file):
+            try:
+                with open(trades_json_file, "r") as f:
+                    trades_list = json.load(f)
+            except Exception:
+                trades_list = []
+        trades_list.append({
+            "timestamp": t_str,
+            "epoch": time.time(),
+            "action": action,
+            "symbol": "BTCUSDT",
+            "qty": float(qty),
+            "price": float(price),
+            "pnl": float(pnl)
+        })
+        if len(trades_list) > 1000:
+            trades_list = trades_list[-1000:]
+        with open(trades_json_file, "w") as f:
+            json.dump(trades_list, f, indent=2)
     except Exception as e:
         pass
 
@@ -341,17 +369,24 @@ def send_welcome(message):
     if not check_auth(message): return
     bot.reply_to(message, 
         f"🤖 <b>Торговый бот Уровень 3 (BTC)</b>\n\n"
+        "📊 <b>Статистика и отчеты:</b>\n"
+        "/stats или /report - 📈 Полная интерактивная статистика (WinRate, PnL, Fees)\n"
+        "/export_csv - 📥 Выгрузить историю сделок в CSV (Excel)\n"
+        "/last_trades - 🧾 Список последних 10 закрытых сделок\n"
+        "/profit - 💸 Быстрый PnL за последние 50 сделок\n\n"
+        "⚡ <b>Управление торговлей:</b>\n"
         "/start_auto - Запустить автоторговлю\n"
         "/stop_auto - Остановить автоторговлю\n"
         "/status - Статус бота и параметров\n"
         "/force_buy - Мгновенно открыть лонг по рынку\n"
-        "/set_aggression [high/normal] - Режим активности (по умолч.: HIGH)\n"
+        "/dca - Принудительно усреднить позицию\n"
+        "/close_all - Закрыть все позиции\n\n"
+        "⚙️ <b>Параметры и ИИ:</b>\n"
+        "/set_aggression [high/normal] - Режим активности\n"
         "/set_dynamic_step [1/0] - Вкл/Выкл умный шаг (ATR)\n"
         "/set_trailing [DROP] - Настроить откат трейлинга\n"
-        "/check_ai - Запросить ИИ-анализ рынка\n\n"
-        "<i>Стандартные настройки:</i>\n"
-        "/profit, /balance, /price\n"
-        "/set_early_cut, /set_leverage, /set_budget, /set_step, /set_qty, /set_sl, /close_all", parse_mode="HTML"
+        "/check_ai - Запросить ИИ-анализ рынка\n"
+        "/balance, /price, /set_early_cut, /set_budget, /set_step, /set_qty, /set_sl", parse_mode="HTML"
     )
 
 @bot.message_handler(commands=['force_buy'])
@@ -699,13 +734,342 @@ def auto_pilot_toggle(message):
     else:
         bot.reply_to(message, "🧠 Автопилот отключен. Возврат к ручным настройкам.", parse_mode="HTML")
 
+# ================= СИСТЕМА ПОЛНОЙ СТАТИСТИКИ И ОТЧЕТНОСТИ =================
+
+def fetch_closed_trades(period_hours=None, limit=100):
+    """
+    Загружает закрытые сделки напрямую из Bybit Closed PnL API.
+    При необходимости фильтрует по заданному окну в часах (например, 24ч, 168ч, 720ч).
+    """
+    try:
+        try:
+            resp = session.get_closed_pnl(category="linear", symbol="BTCUSDT", limit=min(limit, 100))
+        except Exception:
+            resp = session.get_closed_pnl(category="linear", limit=min(limit, 100))
+            
+        raw_list = resp.get('result', {}).get('list', [])
+        if not raw_list:
+            return []
+            
+        now_ms = time.time() * 1000
+        cutoff_ms = (now_ms - period_hours * 3600 * 1000) if period_hours else 0
+        
+        filtered = []
+        for t in raw_list:
+            t_time = safe_float(t.get('updatedTime') or t.get('createdTime'), 0)
+            if cutoff_ms == 0 or t_time >= cutoff_ms:
+                filtered.append(t)
+        return filtered
+    except Exception as e:
+        print(f"Error fetching closed trades: {e}")
+        return []
+
+def compute_trade_metrics(trades):
+    """
+    Вычисляет полную профессиональную аналитику торговли:
+    - Net PnL, Win Rate, Profit Factor, Gross Profit/Loss, Avg Win/Loss, Best/Worst Trade, Fees, Volume
+    """
+    if not trades:
+        return {
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "breakeven": 0,
+            "win_rate": 0.0,
+            "net_pnl": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "profit_factor": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "best_trade": 0.0,
+            "worst_trade": 0.0,
+            "total_fees": 0.0,
+            "total_volume": 0.0
+        }
+        
+    wins_list = []
+    losses_list = []
+    be_list = []
+    pnls = []
+    total_fees = 0.0
+    total_volume = 0.0
+    
+    for t in trades:
+        pnl = safe_float(t.get('closedPnl', 0))
+        qty = safe_float(t.get('qty', 0))
+        exit_p = safe_float(t.get('avgExitPrice', 0)) or safe_float(t.get('orderPrice', 0))
+        fee = safe_float(t.get('cumExecFee', 0)) or safe_float(t.get('execFee', 0))
+        
+        total_fees += abs(fee)
+        total_volume += (qty * exit_p)
+        pnls.append(pnl)
+        
+        if pnl > 0.00001:
+            wins_list.append(pnl)
+        elif pnl < -0.00001:
+            losses_list.append(abs(pnl))
+        else:
+            be_list.append(pnl)
+            
+    total_count = len(trades)
+    wins_count = len(wins_list)
+    losses_count = len(losses_list)
+    be_count = len(be_list)
+    
+    net_pnl = sum(pnls)
+    gross_profit = sum(wins_list)
+    gross_loss = sum(losses_list)
+    
+    win_rate = (wins_count / total_count * 100.0) if total_count > 0 else 0.0
+    
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = 99.99
+    else:
+        profit_factor = 1.0
+        
+    avg_win = (gross_profit / wins_count) if wins_count > 0 else 0.0
+    avg_loss = (gross_loss / losses_count) if losses_count > 0 else 0.0
+    best_trade = max(pnls) if pnls else 0.0
+    worst_trade = min(pnls) if pnls else 0.0
+    
+    return {
+        "total_trades": total_count,
+        "wins": wins_count,
+        "losses": losses_count,
+        "breakeven": be_count,
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": profit_factor,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+        "total_fees": total_fees,
+        "total_volume": total_volume
+    }
+
+def get_stats_inline_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    b1 = InlineKeyboardButton("⏱ 24 часа", callback_data="stats_24h")
+    b2 = InlineKeyboardButton("📅 7 дней", callback_data="stats_7d")
+    b3 = InlineKeyboardButton("🗓 30 дней", callback_data="stats_30d")
+    b4 = InlineKeyboardButton("🏆 Все время", callback_data="stats_all")
+    b5 = InlineKeyboardButton("🧾 Посл. 10 сделок", callback_data="stats_recent")
+    b6 = InlineKeyboardButton("📥 Скачать CSV", callback_data="stats_csv")
+    markup.add(b1, b2)
+    markup.add(b3, b4)
+    markup.add(b5, b6)
+    return markup
+
+def format_stats_report(metrics, period_name="За все время"):
+    pnl = metrics["net_pnl"]
+    pnl_sign = "+" if pnl > 0 else ""
+    pnl_badge = "🟢 В ПЛЮСЕ" if pnl > 0 else ("🔴 В МИНУСЕ" if pnl < 0 else "⚪ В НОЛЬ")
+    
+    filled_blocks = min(10, max(0, int(round(metrics["win_rate"] / 10))))
+    bar = "█" * filled_blocks + "░" * (10 - filled_blocks)
+    
+    text = (
+        f"📊 <b>ПОЛНЫЙ ОТЧЕТ И СТАТИСТИКА БОТА</b>\n"
+        f"Период: <b>{period_name}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Чистый PnL:</b> <code>{pnl_sign}{pnl:.2f} USDT</code> ({pnl_badge})\n\n"
+        f"🎯 <b>Винрейт (Win Rate):</b> <b>{metrics['win_rate']:.1f}%</b>\n"
+        f"<code>[{bar}]</code>\n"
+        f"• Всего закрыто сделок: <b>{metrics['total_trades']}</b>\n"
+        f"• Прибыльных (Win): <b>{metrics['wins']}</b> 🟢\n"
+        f"• Убыточных (Loss): <b>{metrics['losses']}</b> 🔴\n"
+        f"• В безубыток (BE): <b>{metrics['breakeven']}</b> ⚪\n\n"
+        f"⚖️ <b>Показатели эффективности:</b>\n"
+        f"• Профит-фактор: <b>{metrics['profit_factor']:.2f}</b>\n"
+        f"• Общая прибыль (Gross): <code>+{metrics['gross_profit']:.2f} USDT</code>\n"
+        f"• Общий убыток (Gross): <code>-{metrics['gross_loss']:.2f} USDT</code>\n"
+        f"• Средний плюс (Avg Win): <code>+{metrics['avg_win']:.2f} USDT</code>\n"
+        f"• Средний минус (Avg Loss): <code>-{metrics['avg_loss']:.2f} USDT</code>\n"
+        f"• Лучшая сделка: <code>+{metrics['best_trade']:.2f} USDT</code> 🚀\n"
+        f"• Худшая сделка: <code>{metrics['worst_trade']:.2f} USDT</code> 🛡\n\n"
+        f"💳 <b>Комиссии биржи:</b> <code>{metrics['total_fees']:.2f} USDT</code>\n"
+        f"📦 <b>Оборот (Volume):</b> <code>~{metrics['total_volume']:.2f} USDT</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Нажмите кнопки ниже для переключения периода или выгрузки:</i>"
+    )
+    return text
+
+def format_recent_trades_message(trades, count=10):
+    if not trades:
+        return "ℹ️ Нет закрытых сделок в истории биржи."
+        
+    trades_subset = trades[:count]
+    lines = [f"🧾 <b>Последние {len(trades_subset)} закрытых сделок (Bybit)</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+    
+    for i, t in enumerate(trades_subset, 1):
+        t_time_ms = safe_float(t.get('updatedTime') or t.get('createdTime'), 0)
+        dt_str = time.strftime('%d.%m %H:%M', time.gmtime(t_time_ms / 1000)) if t_time_ms else "Н/Д"
+        side = t.get('side', 'Buy')
+        action_name = "LONG" if side == "Buy" else "SHORT"
+        qty = safe_float(t.get('qty', 0))
+        entry_p = safe_float(t.get('avgEntryPrice', 0)) or safe_float(t.get('orderPrice', 0))
+        exit_p = safe_float(t.get('avgExitPrice', 0))
+        pnl = safe_float(t.get('closedPnl', 0))
+        symbol = t.get('symbol', 'BTCUSDT')
+        
+        sign = "+" if pnl > 0 else ""
+        icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+        
+        lines.append(
+            f"{i}️⃣ <b>{dt_str}</b> | <b>{action_name}</b> {qty} {symbol.replace('USDT','')}\n"
+            f"   Вход: <code>{entry_p:.1f}</code> ➔ Выход: <code>{exit_p:.1f}</code>\n"
+            f"   PnL: <b>{sign}{pnl:.2f} USDT</b> {icon}"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+def generate_trades_csv_content(trades):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "DateTime_UTC", "Symbol", "Side", "Qty", 
+        "AvgEntryPrice", "AvgExitPrice", "ClosedPnL_USDT", 
+        "Fee_USDT", "Leverage", "OrderID"
+    ])
+    
+    for t in trades:
+        t_time_ms = safe_float(t.get('updatedTime') or t.get('createdTime'), 0)
+        dt_str = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t_time_ms / 1000)) if t_time_ms else ""
+        writer.writerow([
+            dt_str,
+            t.get('symbol', 'BTCUSDT'),
+            t.get('side', ''),
+            t.get('qty', ''),
+            t.get('avgEntryPrice', ''),
+            t.get('avgExitPrice', ''),
+            t.get('closedPnl', ''),
+            t.get('cumExecFee', '') or t.get('execFee', ''),
+            t.get('leverage', ''),
+            t.get('orderId', '')
+        ])
+    return output.getvalue().encode('utf-8')
+
+@bot.message_handler(commands=['stats', 'report'])
+def stats_cmd(message):
+    if not check_auth(message): return
+    try:
+        trades = fetch_closed_trades(period_hours=None)
+        metrics = compute_trade_metrics(trades)
+        text = format_stats_report(metrics, period_name="За все время (история Bybit)")
+        bot.reply_to(message, text, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка при получении статистики: {e}")
+
+@bot.message_handler(commands=['export_csv'])
+def export_csv_cmd(message):
+    if not check_auth(message): return
+    try:
+        trades = fetch_closed_trades(limit=100)
+        if not trades:
+            bot.reply_to(message, "ℹ️ На бирже пока нет закрытых сделок для экспорта.")
+            return
+        csv_bytes = generate_trades_csv_content(trades)
+        csv_file = io.BytesIO(csv_bytes)
+        csv_file.name = f"trades_report_BTC_{time.strftime('%Y%m%d_%H%M')}.csv"
+        bot.send_document(
+            message.chat.id, 
+            csv_file, 
+            caption=f"📊 <b>Экспорт торговой истории Bybit</b>\nВсего сделок в выгрузке: {len(trades)}\nФормат: CSV (Excel / Google Sheets).",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка при генерации CSV: {e}")
+
+@bot.message_handler(commands=['last_trades'])
+def last_trades_cmd(message):
+    if not check_auth(message): return
+    try:
+        trades = fetch_closed_trades(limit=10)
+        text = format_recent_trades_message(trades, count=10)
+        bot.reply_to(message, text, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith('stats_'))
+def handle_stats_callbacks(call):
+    if call.from_user.id != ALLOWED_USER_ID:
+        try:
+            bot.answer_callback_query(call.id, "Доступ запрещен!")
+        except Exception:
+            pass
+        return
+        
+    data = call.data
+    try:
+        if data == "stats_24h":
+            trades = fetch_closed_trades(period_hours=24)
+            metrics = compute_trade_metrics(trades)
+            text = format_stats_report(metrics, period_name="За последние 24 часа")
+            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+            bot.answer_callback_query(call.id, "Статистика за 24 часа")
+        elif data == "stats_7d":
+            trades = fetch_closed_trades(period_hours=168)
+            metrics = compute_trade_metrics(trades)
+            text = format_stats_report(metrics, period_name="За последние 7 дней")
+            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+            bot.answer_callback_query(call.id, "Статистика за 7 дней")
+        elif data == "stats_30d":
+            trades = fetch_closed_trades(period_hours=720)
+            metrics = compute_trade_metrics(trades)
+            text = format_stats_report(metrics, period_name="За последние 30 дней")
+            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+            bot.answer_callback_query(call.id, "Статистика за 30 дней")
+        elif data == "stats_all":
+            trades = fetch_closed_trades(period_hours=None)
+            metrics = compute_trade_metrics(trades)
+            text = format_stats_report(metrics, period_name="За все время (история Bybit)")
+            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+            bot.answer_callback_query(call.id, "Статистика за все время")
+        elif data == "stats_recent":
+            trades = fetch_closed_trades(limit=10)
+            text = format_recent_trades_message(trades, count=10)
+            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+            bot.answer_callback_query(call.id, "Последние 10 сделок")
+        elif data == "stats_csv":
+            bot.answer_callback_query(call.id, "Формирую CSV...")
+            trades = fetch_closed_trades(limit=100)
+            if not trades:
+                bot.send_message(call.message.chat.id, "ℹ️ Нет закрытых сделок для экспорта.")
+                return
+            csv_bytes = generate_trades_csv_content(trades)
+            csv_file = io.BytesIO(csv_bytes)
+            csv_file.name = f"trading_report_BTC_{time.strftime('%Y%m%d_%H%M')}.csv"
+            bot.send_document(call.message.chat.id, csv_file, caption="📥 <b>Полный отчет по сделкам Bybit (CSV)</b>\nФайл можно открыть в Excel или Google Таблицах.", parse_mode="HTML")
+    except Exception as e:
+        try:
+            bot.answer_callback_query(call.id, f"Ошибка: {e}")
+        except Exception:
+            pass
+
 @bot.message_handler(commands=['profit'])
 def profit_cmd(message):
     if not check_auth(message): return
     try:
-        resp = session.get_closed_pnl(category="linear", limit=50)
-        total_pnl = sum(safe_float(x.get('closedPnl', 0)) for x in resp['result']['list'])
-        bot.reply_to(message, f"💸 <b>Прибыль (последние 50 сделок):</b>\n{total_pnl:.2f} USDT", parse_mode="HTML")
+        trades = fetch_closed_trades(limit=50)
+        metrics = compute_trade_metrics(trades)
+        pnl = metrics["net_pnl"]
+        sign = "+" if pnl > 0 else ""
+        badge = "🟢 В ПЛЮСЕ" if pnl > 0 else ("🔴 В МИНУСЕ" if pnl < 0 else "⚪")
+        
+        reply = (
+            f"💸 <b>Финансовый результат (последние 50 сделок):</b>\n"
+            f"Чистый PnL: <b>{sign}{pnl:.2f} USDT</b> ({badge})\n"
+            f"Винрейт: <b>{metrics['win_rate']:.1f}%</b> ({metrics['wins']}W / {metrics['losses']}L)\n"
+            f"Комиссии биржи: <code>{metrics['total_fees']:.2f} USDT</code>\n\n"
+            f"<i>Для детальной аналитики по периодам и выгрузки нажмите кнопки ниже или используйте /stats</i>"
+        )
+        bot.reply_to(message, reply, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
@@ -745,17 +1109,56 @@ def monitor_price():
                     status_str = "АКТИВНА" if state.get("auto_trade") else "ПАУЗА (ИИ)" if state.get("auto_paused") else "ВЫКЛ"
                     
                     report_text = (
-                        f"📝 <b>Регулярный отчет (каждые 10 мин)</b>\n\n"
-                        f"🤖 Статус: Автоторговля {status_str}\n"
-                        f"📈 Текущая цена BTC: {rep_price}\n"
-                        f"🎯 Цена отсчета (база): {state.get('base_price', rep_price)}\n"
-                        f"📊 Открытая позиция: {r_pos_size} BTC\n"
-                        f"💧 Нереализованный PnL: {r_unrealised:.2f} USDT\n"
-                        f"💸 Прибыль (за 50 сделок): {total_pnl:.2f} USDT"
+                        f"📝 <b>Регулярный отчет (BTCUSDT)</b>\n\n"
+                        f"🤖 Статус: Автоторговля <b>{status_str}</b>\n"
+                        f"📈 Текущая цена: <b>{rep_price:.1f} USDT</b>\n"
+                        f"🎯 Базовая цена: <code>{state.get('base_price', rep_price)}</code>\n"
+                        f"📊 Позиция: <b>{r_pos_size} BTC</b> (uPnL: <code>{r_unrealised:.2f} USDT</code>)\n"
+                        f"💸 Прибыль (посл. 50): <b>{total_pnl:.2f} USDT</b>"
                     )
-                    bot.send_message(ALLOWED_USER_ID, report_text, parse_mode="HTML")
+                    quick_kb = InlineKeyboardMarkup(row_width=2)
+                    quick_kb.add(
+                        InlineKeyboardButton("📊 Полная статистика", callback_data="stats_all"),
+                        InlineKeyboardButton("📥 Скачать CSV", callback_data="stats_csv")
+                    )
+                    bot.send_message(ALLOWED_USER_ID, report_text, reply_markup=quick_kb, parse_mode="HTML")
                 except Exception as e:
                     print(f"Report error: {e}")
+
+            # --- ЕЖЕДНЕВНЫЙ АВТОМАТИЧЕСКИЙ ОТЧЕТ (Раз в сутки) ---
+            try:
+                utc_today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+                if state.get("last_daily_report_date") != utc_today:
+                    d_trades = fetch_closed_trades(period_hours=24)
+                    d_metrics = compute_trade_metrics(d_trades)
+                    
+                    bal_resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+                    if not bal_resp.get('result') or not bal_resp['result'].get('list'):
+                        bal_resp = session.get_wallet_balance(accountType="CONTRACT", coin="USDT")
+                    cur_bal = 0.0
+                    if bal_resp.get('result') and bal_resp['result'].get('list'):
+                        for c in bal_resp['result']['list'][0].get('coin', []):
+                            if c.get('coin') == 'USDT':
+                                cur_bal = safe_float(c.get('walletBalance', 0))
+                                break
+                    pnl_sign = "+" if d_metrics['net_pnl'] > 0 else ""
+                    daily_msg = (
+                        f"🌅 <b>ИТОГОВЫЙ ОТЧЕТ ЗА ДЕНЬ ({utc_today} UTC)</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"💰 <b>PnL за 24 часа:</b> <code>{pnl_sign}{d_metrics['net_pnl']:.2f} USDT</code>\n"
+                        f"🎯 <b>Сделок за день:</b> {d_metrics['total_trades']} (Win: {d_metrics['wins']} | Loss: {d_metrics['losses']})\n"
+                        f"📈 <b>Винрейт (24ч):</b> <b>{d_metrics['win_rate']:.1f}%</b>\n"
+                        f"⚖️ <b>Профит-фактор:</b> <b>{d_metrics['profit_factor']:.2f}</b>\n"
+                        f"💳 <b>Комиссии биржи:</b> <code>{d_metrics['total_fees']:.2f} USDT</code>\n"
+                        f"🏦 <b>Баланс кошелька:</b> <b>{cur_bal:.2f} USDT</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"<i>Для детальной истории введите /stats или нажмите кнопку:</i>"
+                    )
+                    bot.send_message(ALLOWED_USER_ID, daily_msg, reply_markup=get_stats_inline_keyboard(), parse_mode="HTML")
+                    state["last_daily_report_date"] = utc_today
+                    save_state(state)
+            except Exception as d_err:
+                print(f"Daily digest error: {d_err}")
                     
             if state.get("auto_trade"):
 
@@ -1096,19 +1499,22 @@ def monitor_price():
 def setup_commands():
     commands = [
         telebot.types.BotCommand("start", "ℹ️ Меню и команды"),
+        telebot.types.BotCommand("stats", "📊 Полная статистика и аналитика"),
+        telebot.types.BotCommand("export_csv", "📥 Выгрузить историю сделок (CSV)"),
+        telebot.types.BotCommand("last_trades", "🧾 Последние закрытые сделки"),
+        telebot.types.BotCommand("profit", "💸 Экспресс-профит за 50 сделок"),
         telebot.types.BotCommand("force_buy", "⚡ Немедленно войти в ЛОНГ"),
         telebot.types.BotCommand("start_auto", "▶️ Запуск автоторговли"),
         telebot.types.BotCommand("stop_auto", "⏸ Стоп автоторговли"),
         telebot.types.BotCommand("status", "📊 Полный статус бота"),
-        telebot.types.BotCommand("set_aggression", "🔥 Активность (high/normal)"),
-        telebot.types.BotCommand("set_early_cut", "✂️ Порог сброса минуса"),
-        telebot.types.BotCommand("set_dynamic_step", "⚙️ Умный шаг сетки (ATR)"),
-        telebot.types.BotCommand("set_trailing", "⚙️ Откат трейлинга"),
-        telebot.types.BotCommand("profit", "💸 Прибыль за 50 сделок"),
         telebot.types.BotCommand("balance", "💰 Баланс аккаунта"),
         telebot.types.BotCommand("price", "📈 Текущая цена BTC"),
         telebot.types.BotCommand("check_ai", "🧠 Проверить ИИ"),
         telebot.types.BotCommand("dca", "🚑 Принудительное усреднение"),
+        telebot.types.BotCommand("set_aggression", "🔥 Активность (high/normal)"),
+        telebot.types.BotCommand("set_early_cut", "✂️ Порог сброса минуса"),
+        telebot.types.BotCommand("set_dynamic_step", "⚙️ Умный шаг сетки (ATR)"),
+        telebot.types.BotCommand("set_trailing", "⚙️ Откат трейлинга"),
         telebot.types.BotCommand("set_step", "⚙️ Шаг сетки"),
         telebot.types.BotCommand("set_qty", "⚙️ Объем ордера"),
         telebot.types.BotCommand("set_sl", "⚙️ Изменить Stop-Loss"),
