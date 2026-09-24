@@ -377,7 +377,7 @@ def send_welcome(message):
         "⚡ <b>Управление торговлей:</b>\n"
         "/start_auto - Запустить автоторговлю\n"
         "/stop_auto - Остановить автоторговлю\n"
-        "/status - Статус бота и параметров\n"
+        "/status - 🤖 Статус бота (торгует/нет, цена, позиция) + Аналитика торговли\n"
         "/force_buy - Мгновенно открыть лонг по рынку\n"
         "/dca - Принудительно усреднить позицию\n"
         "/close_all - Закрыть все позиции\n\n"
@@ -498,21 +498,26 @@ def stop_auto(message):
 @bot.message_handler(commands=['status'])
 def get_status(message):
     if not check_auth(message): return
-    status_text = (
-        f"📊 <b>Статус бота</b>\n\n"
-        f"Автоторговля: {'✅ ВКЛ' if state.get('auto_trade') else '⏸ ВЫКЛ'}\n"
-        f"Режим входа: <b>{state.get('aggression', 'high').upper()}</b> (Всегда агрессивен + RSI Trend Flow)\n"
-        f"Базовая цена: {state.get('base_price', 0)}\n"
-        f"Динамический шаг (ATR): {'✅ ВКЛ' if state.get('dynamic_step') else '⏸ ВЫКЛ'}\n"
-        f"Шаг (статика): {state.get('step', 500)}\n"
-        f"Объем: {state.get('qty', 0.001)}\n"
-        f"Бюджет: {state.get('budget', 240)} USDT\n"
-        f"Stop-Loss: {state.get('sl_percent', 15.0)}%\n"
-        f"Сброс при просадке (Early Cut): <b>-{state.get('early_cut_loss', 3.0):.2f} USDT</b>\n"
-        f"Трейлинг откат: {state.get('trailing_drop', 100)}\n"
-        f"Активен трейлинг: {'✅ ДА' if state.get('trailing_active') else 'НЕТ'}\n"
-    )
-    bot.reply_to(message, status_text, parse_mode="HTML")
+    try:
+        status_text = generate_full_status_text()
+        bot.reply_to(message, status_text, reply_markup=get_status_inline_keyboard(), parse_mode="HTML")
+    except Exception as e:
+        status_text = (
+            f"📊 <b>Статус бота</b>\n\n"
+            f"Автоторговля: {'✅ ВКЛ' if state.get('auto_trade') else '⏸ ВЫКЛ'}\n"
+            f"Режим входа: <b>{state.get('aggression', 'high').upper()}</b>\n"
+            f"Базовая цена: {state.get('base_price', 0)}\n"
+            f"Динамический шаг (ATR): {'✅ ВКЛ' if state.get('dynamic_step') else '⏸ ВЫКЛ'}\n"
+            f"Шаг (статика): {state.get('step', 500)}\n"
+            f"Объем: {state.get('qty', 0.001)}\n"
+            f"Бюджет: {state.get('budget', 240)} USDT\n"
+            f"Stop-Loss: {state.get('sl_percent', 15.0)}%\n"
+            f"Сброс при просадке (Early Cut): <b>-{state.get('early_cut_loss', 3.0):.2f} USDT</b>\n"
+            f"Трейлинг откат: {state.get('trailing_drop', 100)}\n"
+            f"Активен трейлинг: {'✅ ДА' if state.get('trailing_active') else 'НЕТ'}\n\n"
+            f"⚠️ Ошибка получения расширенных данных: {e}"
+        )
+        bot.reply_to(message, status_text, parse_mode="HTML")
 
 @bot.message_handler(commands=['check_keys'])
 def check_keys_cmd(message):
@@ -853,18 +858,192 @@ def compute_trade_metrics(trades):
         "total_volume": total_volume
     }
 
+def get_status_inline_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    b_refresh = InlineKeyboardButton("🔄 Обновить статус", callback_data="status_refresh")
+    b_report = InlineKeyboardButton("📊 Полный отчет", callback_data="stats_all")
+    b_24h = InlineKeyboardButton("⏱ 24 часа", callback_data="stats_24h")
+    b_7d = InlineKeyboardButton("📅 7 дней", callback_data="stats_7d")
+    b_recent = InlineKeyboardButton("🧾 Посл. 10 сделок", callback_data="stats_recent")
+    b_csv = InlineKeyboardButton("📥 Скачать CSV", callback_data="stats_csv")
+    markup.add(b_refresh, b_report)
+    markup.add(b_24h, b_7d)
+    markup.add(b_recent, b_csv)
+    return markup
+
 def get_stats_inline_keyboard():
     markup = InlineKeyboardMarkup(row_width=2)
+    b_status = InlineKeyboardButton("🤖 Статус бота", callback_data="show_status")
+    b4 = InlineKeyboardButton("🏆 Все время", callback_data="stats_all")
     b1 = InlineKeyboardButton("⏱ 24 часа", callback_data="stats_24h")
     b2 = InlineKeyboardButton("📅 7 дней", callback_data="stats_7d")
     b3 = InlineKeyboardButton("🗓 30 дней", callback_data="stats_30d")
-    b4 = InlineKeyboardButton("🏆 Все время", callback_data="stats_all")
     b5 = InlineKeyboardButton("🧾 Посл. 10 сделок", callback_data="stats_recent")
     b6 = InlineKeyboardButton("📥 Скачать CSV", callback_data="stats_csv")
+    markup.add(b_status, b4)
     markup.add(b1, b2)
-    markup.add(b3, b4)
-    markup.add(b5, b6)
+    markup.add(b3, b5)
+    markup.add(b6)
     return markup
+
+def generate_full_status_text():
+    """
+    Формирует полный объединенный статус бота:
+    1. Торгует бот или нет (АКТИВНА / НА ПАУЗЕ ИИ / ВЫКЛ)
+    2. Текущая цена Bybit в реальном времени и базовая цена сетки
+    3. Открытая позиция: размер (BTC), средняя цена входа, uPnL в USDT и %, маржа, ликвидация
+    4. Баланс кошелька USDT (всего и доступно)
+    5. Параметры сетки: шаг DCA (ATR/статика), объем ордера, бюджет, SL, Early Cut, Трейлинг
+    6. Полная аналитика торговли: PnL 24ч, WinRate 24ч, общий PnL, общий WinRate, профит-фактор, комиссии биржи
+    """
+    # 1. Состояние автоторговли
+    is_auto = state.get("auto_trade", False)
+    is_paused = state.get("auto_paused", False)
+    if is_auto and is_paused:
+        status_trade_str = "⏸ <b>НА ПАУЗЕ</b> (Защита ИИ / Сентимент Bearish)"
+    elif is_auto:
+        status_trade_str = "🟢 <b>АКТИВНА (ТОРГУЕТ)</b>"
+    else:
+        status_trade_str = "🛑 <b>ВЫКЛЮЧЕНА (Остановлена)</b>"
+
+    auto_pilot_str = "✅ ВКЛ (Адаптивный ATR)" if state.get("auto_pilot") else "⏸ ВЫКЛ (Ручной)"
+    aggression = str(state.get("aggression", "high")).upper()
+    dyn_step_flag = state.get("dynamic_step", False)
+    dyn_step_str = "✅ ВКЛ (ATR)" if dyn_step_flag else "⏸ ВЫКЛ"
+
+    # 2. Текущая рыночная цена Bybit
+    current_price = 0.0
+    try:
+        ticker_resp = session.get_tickers(category="linear", symbol="BTCUSDT")
+        if ticker_resp.get("result", {}).get("list"):
+            current_price = safe_float(ticker_resp["result"]["list"][0].get("lastPrice", 0))
+    except Exception as e:
+        print(f"Status ticker fetch error: {e}")
+
+    # 3. Базовая цена и отклонение
+    base_price = safe_float(state.get("base_price", 0))
+    if base_price > 0 and current_price > 0:
+        price_diff = current_price - base_price
+        price_pct = (price_diff / base_price) * 100
+        sign_diff = "+" if price_diff > 0 else ""
+        base_str = f"{base_price:,.1f} USDT ({sign_diff}{price_diff:,.1f} | {price_pct:+.2f}%)"
+    elif base_price > 0:
+        base_str = f"{base_price:,.1f} USDT"
+    else:
+        base_str = "Не установлена (ожидает запуска)"
+
+    # 4. Открытая позиция
+    pos_size = 0.0
+    avg_price = 0.0
+    unrealised_pnl = 0.0
+    pos_margin = 0.0
+    liq_price = 0.0
+    pos_side = "None"
+    try:
+        pos_resp = session.get_positions(category="linear", symbol="BTCUSDT")
+        if pos_resp.get("result", {}).get("list"):
+            p_data = pos_resp["result"]["list"][0]
+            pos_size = safe_float(p_data.get("size", 0))
+            avg_price = safe_float(p_data.get("avgPrice", 0))
+            unrealised_pnl = safe_float(p_data.get("unrealisedPnl", 0))
+            pos_margin = safe_float(p_data.get("positionIM", 0))
+            liq_price = safe_float(p_data.get("liqPrice", 0))
+            pos_side = p_data.get("side", "None")
+    except Exception as e:
+        print(f"Status position fetch error: {e}")
+
+    if pos_size > 0:
+        upnl_sign = "+" if unrealised_pnl > 0 else ""
+        upnl_pct = (unrealised_pnl / pos_margin * 100) if pos_margin > 0 else 0.0
+        upnl_badge = "🟢" if unrealised_pnl > 0 else ("🔴" if unrealised_pnl < 0 else "⚪")
+        side_label = "LONG" if pos_side == "Buy" else ("SHORT" if pos_side == "Sell" else pos_side.upper())
+        pos_details = (
+            f"• Статус: 🟢 <b>В позиции ({side_label})</b>\n"
+            f"• Объем: <b>{pos_size} BTC</b>\n"
+            f"• Вход: <code>{avg_price:,.1f} USDT</code>\n"
+            f"• uPnL: {upnl_badge} <b>{upnl_sign}{unrealised_pnl:.2f} USDT</b> (<code>{upnl_pct:+.2f}%</code>)\n"
+            f"• Маржа: <code>{pos_margin:.2f} USDT</code>"
+        )
+        if liq_price > 0:
+            pos_details += f" | Ликвидация: <code>{liq_price:,.1f}</code>"
+    else:
+        pos_details = "• Статус: ⚪ <b>Вне позиции</b> (позиция закрыта, бот ждет условия)"
+
+    # 5. Баланс кошелька USDT
+    wallet_bal = 0.0
+    avail_bal = 0.0
+    try:
+        bal_resp = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        if not bal_resp.get("result") or not bal_resp["result"].get("list"):
+            bal_resp = session.get_wallet_balance(accountType="CONTRACT", coin="USDT")
+        if bal_resp.get("result", {}).get("list"):
+            coins = bal_resp["result"]["list"][0].get("coin", [])
+            for c in coins:
+                if c.get("coin") == "USDT":
+                    wallet_bal = safe_float(c.get("walletBalance", 0))
+                    avail_bal = safe_float(c.get("availableToWithdraw", 0)) or safe_float(c.get("walletBalance", 0))
+                    break
+    except Exception as e:
+        print(f"Status balance error: {e}")
+
+    # 6. Параметры сетки и риск-менеджмент
+    step = state.get("step", 500)
+    qty = state.get("qty", 0.001)
+    budget = state.get("budget", 240)
+    sl_percent = state.get("sl_percent", 15.0)
+    early_cut = state.get("early_cut_loss", 3.0)
+    trailing_drop = state.get("trailing_drop", 100)
+    trailing_active = "✅ ДА" if state.get("trailing_active") else "⏸ НЕТ"
+
+    # 7. Торговая аналитика Bybit
+    try:
+        trades_24h = fetch_closed_trades(period_hours=24)
+        m24 = compute_trade_metrics(trades_24h)
+    except Exception:
+        m24 = compute_trade_metrics([])
+
+    try:
+        trades_all = fetch_closed_trades(period_hours=None)
+        m_all = compute_trade_metrics(trades_all)
+    except Exception:
+        m_all = compute_trade_metrics([])
+
+    pnl_24_sign = "+" if m24["net_pnl"] > 0 else ""
+    pnl_all_sign = "+" if m_all["net_pnl"] > 0 else ""
+    badge_24 = "🟢" if m24["net_pnl"] > 0 else ("🔴" if m24["net_pnl"] < 0 else "⚪")
+    badge_all = "🟢" if m_all["net_pnl"] > 0 else ("🔴" if m_all["net_pnl"] < 0 else "⚪")
+
+    cur_price_str = f"<b>{current_price:,.1f} USDT</b>" if current_price > 0 else "<code>API Недоступен</code>"
+
+    msg = (
+        f"🤖 <b>СТАТУС И АНАЛИТИКА БОТА (BTCUSDT)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ <b>Автоторговля:</b> {status_trade_str}\n"
+        f"🧠 <b>Автопилот:</b> {auto_pilot_str}\n"
+        f"🎯 <b>Режим входа:</b> <code>{aggression}</code> (RSI Trend Flow)\n\n"
+        f"📈 <b>РЫНОК И БАЛАНС:</b>\n"
+        f"• Цена BTC: {cur_price_str}\n"
+        f"• Базовая цена: <code>{base_str}</code>\n"
+        f"• Баланс кошелька: <b>{wallet_bal:.2f} USDT</b> (Доступно: {avail_bal:.2f})\n\n"
+        f"💼 <b>ТЕКУЩАЯ ПОЗИЦИЯ:</b>\n"
+        f"{pos_details}\n\n"
+        f"⚙️ <b>ПАРАМЕТРЫ СЕТКИ:</b>\n"
+        f"• Шаг DCA: <code>{step} USDT</code> (ATR шаг: {dyn_step_str})\n"
+        f"• Объем ордера: <code>{qty} BTC</code> | Бюджет: <code>{budget} USDT</code>\n"
+        f"• Трейлинг откат: <code>{trailing_drop} USDT</code> (Активен: {trailing_active})\n"
+        f"• Защита: Stop-Loss <code>{sl_percent}%</code> | Early Cut <code>-{early_cut:.2f} USDT</code>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>РЕЗУЛЬТАТЫ ТОРГОВЛИ (АНАЛИТИКА):</b>\n"
+        f"💰 <b>PnL за 24 часа:</b> {badge_24} <code>{pnl_24_sign}{m24['net_pnl']:.2f} USDT</code>\n"
+        f"🎯 <b>Винрейт (24ч):</b> <b>{m24['win_rate']:.1f}%</b> ({m24['wins']}W / {m24['losses']}L)\n"
+        f"💰 <b>PnL общий (Bybit):</b> {badge_all} <code>{pnl_all_sign}{m_all['net_pnl']:.2f} USDT</code>\n"
+        f"🏆 <b>Винрейт общий:</b> <b>{m_all['win_rate']:.1f}%</b> ({m_all['wins']}W / {m_all['losses']}L / {m_all['breakeven']}BE)\n"
+        f"⚖️ <b>Профит-фактор:</b> <b>{m_all['profit_factor']:.2f}</b>\n"
+        f"💳 <b>Комиссии биржи:</b> <code>{m_all['total_fees']:.2f} USDT</code>\n"
+        f"🧾 <b>Всего закрыто сделок:</b> {m_all['total_trades']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    return msg
 
 def format_stats_report(metrics, period_name="За все время"):
     pnl = metrics["net_pnl"]
@@ -996,7 +1175,7 @@ def last_trades_cmd(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
-@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith('stats_'))
+@bot.callback_query_handler(func=lambda call: call.data and (call.data.startswith('stats_') or call.data in ('show_status', 'status_refresh')))
 def handle_stats_callbacks(call):
     if call.from_user.id != ALLOWED_USER_ID:
         try:
@@ -1007,7 +1186,17 @@ def handle_stats_callbacks(call):
         
     data = call.data
     try:
-        if data == "stats_24h":
+        if data in ("show_status", "status_refresh"):
+            text = generate_full_status_text()
+            try:
+                bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_status_inline_keyboard(), parse_mode="HTML")
+                bot.answer_callback_query(call.id, "✅ Статус бота обновлен")
+            except Exception as edit_err:
+                if "message is not modified" in str(edit_err).lower():
+                    bot.answer_callback_query(call.id, "⚡ Данные уже актуальны")
+                else:
+                    bot.answer_callback_query(call.id, f"Ошибка: {edit_err}")
+        elif data == "stats_24h":
             trades = fetch_closed_trades(period_hours=24)
             metrics = compute_trade_metrics(trades)
             text = format_stats_report(metrics, period_name="За последние 24 часа")
@@ -1118,7 +1307,11 @@ def monitor_price():
                     )
                     quick_kb = InlineKeyboardMarkup(row_width=2)
                     quick_kb.add(
-                        InlineKeyboardButton("📊 Полная статистика", callback_data="stats_all"),
+                        InlineKeyboardButton("🤖 Статус бота", callback_data="show_status"),
+                        InlineKeyboardButton("📊 Аналитика", callback_data="stats_all")
+                    )
+                    quick_kb.add(
+                        InlineKeyboardButton("⏱ За 24ч", callback_data="stats_24h"),
                         InlineKeyboardButton("📥 Скачать CSV", callback_data="stats_csv")
                     )
                     bot.send_message(ALLOWED_USER_ID, report_text, reply_markup=quick_kb, parse_mode="HTML")
